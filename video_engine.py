@@ -57,7 +57,7 @@ def synthesize(text: str, destination: Path, voice: str) -> None:
                     if attempt == 2:
                         raise RuntimeError(
                             f"Dịch vụ giọng đọc không trả âm thanh cho đoạn {index + 1}/"
-                            f"{len(chunks)} sau 3 lần thử. Hãy thử lại sau vài phút hoặc "
+                            f"{len(chunks)} sau 3 lần thử ({type(exc).__name__}). Hãy thử lại sau vài phút hoặc "
                             "thử mạng khác. Nếu vẫn lỗi, dịch vụ TTS cần được kiểm tra; "
                             "không cần cài lại ứng dụng."
                         ) from exc
@@ -123,7 +123,7 @@ def ducking_envelope(samples: np.ndarray, sample_rate: int,
 
 def render_video(media: list[Path], narration: Path, output: Path,
                  bgm: Path | None = None, size=(1280, 720), fps=24,
-                 transition=0.4, bgm_volume=0.22) -> Path:
+                 transition=0.4, bgm_volume=0.22, scene_durations=None) -> Path:
     """Fit all visuals to narration, looping short videos and discarding source audio.
 
     Crossfades overlap adjacent clips. All media readers close even on failure.
@@ -139,12 +139,18 @@ def render_video(media: list[Path], narration: Path, output: Path,
         if not duration or duration <= 0:
             raise ValueError("File giọng đọc không có thời lượng hợp lệ.")
         count = max(1, len(media))
-        step = duration / count
-        fade = min(max(0, transition), step / 2)
+        if scene_durations is not None:
+            weights = np.asarray(scene_durations, dtype=float)
+            if len(weights) != count or not np.all(np.isfinite(weights)) or np.any(weights <= 0):
+                raise ValueError("Thời lượng cảnh không hợp lệ.")
+            lengths = weights / weights.sum() * duration
+        else:
+            lengths = np.full(count, duration / count)
+        fade = min(max(0, transition), float(min(lengths)) / 2)
         layers = []
+        start = 0.0
         for i in range(count):
-            start = i * step
-            length = step + (fade if i < count - 1 else 0)
+            length = float(lengths[i]) + (fade if i < count - 1 else 0)
             if not media:
                 clip = own(ColorClip(size, color=(24, 32, 48), duration=length))
             elif media[i].suffix.lower() in IMAGES:
@@ -162,6 +168,7 @@ def render_video(media: list[Path], narration: Path, output: Path,
             if i:
                 clip = clip.with_effects([vfx.CrossFadeIn(fade)])
             layers.append(clip)
+            start += float(lengths[i])
 
         audio = voice
         if bgm:
