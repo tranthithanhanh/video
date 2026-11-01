@@ -3,11 +3,15 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import subprocess
+import textwrap
 from contextlib import ExitStack
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import edge_tts
+from aiohttp import ClientError
 from edge_tts import communicate as edge_communicate
 import numpy as np
 from moviepy.audio.AudioClip import AudioArrayClip
@@ -22,14 +26,56 @@ IMAGES = {".jpg", ".jpeg", ".png", ".webp"}
 
 
 def synthesize(text: str, destination: Path, voice: str) -> None:
-    """Requires access to Microsoft's online Edge speech service."""
+    """Synthesize short segments with bounded retries; publish only complete audio."""
     if not text.strip():
         raise ValueError("Vui lòng nhập kịch bản.")
     proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
     # Edge TTS 7 builds its own certifi context. Add the system/SSL_CERT_FILE
     # trust roots for managed HTTPS proxies; certificate verification stays on.
     edge_communicate._SSL_CTX.load_default_certs()
-    asyncio.run(edge_tts.Communicate(text.strip(), voice, proxy=proxy).save(str(destination)))
+    cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text).strip()
+    if not cleaned:
+        raise ValueError("Kịch bản không có nội dung đọc hợp lệ.")
+    chunks = textwrap.wrap(cleaned, width=400, break_long_words=True,
+                           break_on_hyphens=False)
+    destination = Path(destination).resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    async def generate(folder):
+        for index, chunk in enumerate(chunks):
+            part = folder / f"part_{index:04d}.mp3"
+            for attempt in range(3):
+                try:
+                    await edge_tts.Communicate(chunk, voice, proxy=proxy,
+                        connect_timeout=15, receive_timeout=45).save(str(part))
+                    if not part.exists() or part.stat().st_size == 0:
+                        raise edge_tts.exceptions.NoAudioReceived("Empty audio")
+                    break
+                except (edge_tts.exceptions.NoAudioReceived, ClientError,
+                        asyncio.TimeoutError) as exc:
+                    part.unlink(missing_ok=True)
+                    if attempt == 2:
+                        raise RuntimeError(
+                            f"Dịch vụ giọng đọc không trả âm thanh cho đoạn {index + 1}/"
+                            f"{len(chunks)} sau 3 lần thử. Hãy thử lại sau vài phút hoặc "
+                            "thử mạng khác. Nếu vẫn lỗi, dịch vụ TTS cần được kiểm tra; "
+                            "không cần cài lại ứng dụng."
+                        ) from exc
+                    await asyncio.sleep(2 ** (attempt + 1))
+            if index < len(chunks) - 1:
+                await asyncio.sleep(0.5)
+
+    with TemporaryDirectory(prefix="tts-", dir=destination.parent) as temp:
+        folder = Path(temp)
+        asyncio.run(generate(folder))
+        manifest = folder / "parts.txt"
+        manifest.write_text("".join(f"file 'part_{i:04d}.mp3'\n"
+                                    for i in range(len(chunks))), encoding="utf-8")
+        completed = folder / "complete.mp3"
+        subprocess.run([FFMPEG_BINARY, "-v", "error", "-y", "-f", "concat",
+            "-safe", "0", "-i", str(manifest), "-vn", "-c:a", "libmp3lame",
+            str(completed)], capture_output=True, check=True)
+        completed.replace(destination)
 
 
 def load_audio(path: Path):
